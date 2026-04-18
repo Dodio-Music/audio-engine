@@ -3,7 +3,7 @@
     {
       "target_name": "dodio_audio",
       "sources": [
-        "native/test.cpp"
+        "native/audio_player.cpp"
       ],
       "include_dirs": [
         "<!(node -p \"require('node-addon-api').include_dir\")"

@@ -1,7 +1,26 @@
-export function hello(): string;
+import {Buffer} from "node:buffer";
+
+export interface AudioPlayerState {
+    initialized: boolean;
+    sampleRate: number;
+    channels: number;
+    bufferedFrames: number;
+    underrunCount: number;
+    transportState: "stopped" | "playing" | "paused";
+}
+
+export class AudioPlayer {
+    constructor();
+    initDevice(): boolean;
+    play(): void;
+    stop(): void;
+    write(buffer: Buffer): number;
+    getState(): AudioPlayerState;
+    pause(): void;
+}
 
 declare const _default: {
-    hello: () => string;
-}
+    AudioPlayer: typeof AudioPlayer;
+};
 
 export default _default;
