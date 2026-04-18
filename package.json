@@ -1,0 +1,25 @@
+{
+    "name": "dodio-audio-engine",
+    "version": "0.1.0",
+    "description": "An audio engine developed for the dodio desktop app.",
+    "main": "index.js",
+    "scripts": {},
+    "repository": {
+        "type": "git",
+        "url": "git+https://github.com/Dodio-Music/audio-engine.git"
+    },
+    "keywords": [],
+    "author": "Dodio Team",
+    "license": "ISC",
+    "type": "commonjs",
+    "bugs": {
+        "url": "https://github.com/Dodio-Music/audio-engine/issues"
+    },
+    "homepage": "https://github.com/Dodio-Music/audio-engine#readme",
+    "dependencies": {
+        "node-addon-api": "^8.7.0"
+    },
+    "devDependencies": {
+        "node-gyp": "^12.2.0"
+    }
+}
