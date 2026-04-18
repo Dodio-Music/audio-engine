@@ -3,7 +3,12 @@
     "version": "0.1.0",
     "description": "An audio engine developed for the dodio desktop app.",
     "main": "index.js",
-    "scripts": {},
+    "scripts": {
+        "install": "node-gyp rebuild",
+        "build": "node-gyp rebuild",
+        "rebuild": "node-gyp rebuild",
+        "clean": "node-gyp clean"
+    },
     "repository": {
         "type": "git",
         "url": "git+https://github.com/Dodio-Music/audio-engine.git"
