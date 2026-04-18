@@ -2,7 +2,15 @@
     "name": "dodio-audio-engine",
     "version": "0.1.0",
     "description": "An audio engine developed for the dodio desktop app.",
-    "main": "index.js",
+    "main": "index.cjs",
+    "types": "index.d.ts",
+    "exports": {
+        ".": {
+            "require": "./index.cjs",
+            "import": "./index.mjs",
+            "types": "./index.d.ts"
+        }
+    },
     "scripts": {
         "install": "node-gyp rebuild",
         "build": "node-gyp rebuild",
