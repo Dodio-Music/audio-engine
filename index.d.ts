@@ -7,12 +7,16 @@ export interface AudioPlayerState {
     bufferCapacityFrames: number;
     underrunCount: number;
     eos: boolean;
-    transportState: "stopped" | "playing" | "paused";
+    transportState: "stopped" | "buffering" | "playing" | "paused";
 }
 
 export class AudioPlayer {
     constructor();
-    initDevice(): boolean;
+    initDevice({bufferCapacityMs, drainLowWaterMs, startThresholdMs}?: {
+        bufferCapacityMs: number,
+        drainLowWaterMs: number,
+        startThresholdMs: number
+    }): boolean;
     play(): void;
     stop(): void;
     write(buffer: Buffer): number;

@@ -35,8 +35,9 @@ private:
 
     enum class TransportState : uint32_t {
         Stopped = 0,
-        Playing = 1,
-        Paused = 2
+        Buffering = 1,
+        Playing = 2,
+        Paused = 3
     };
     std::atomic<TransportState> transportState_{TransportState::Stopped};
 
@@ -63,6 +64,8 @@ private:
 
     void QueueDrainEvent();
     void QueueEndedEvent();
+
+    bool ShouldStartPlayback() const;
 };
 
 Napi::FunctionReference AudioPlayer::constructor;
@@ -178,6 +181,7 @@ void AudioPlayer::QueueEndedEvent() {
 
     const napi_status status = endedTsfn_.NonBlockingCall(
         [this](Napi::Env env, const Napi::Function cb) {
+            endedQueued_.store(false, std::memory_order_relaxed);
             cb.Call({});
         }
     );
@@ -196,6 +200,11 @@ Napi::Value AudioPlayer::EndOfStream(const Napi::CallbackInfo& info) {
     }
 
     eos_.store(true, std::memory_order_relaxed);
+
+    if (transportState_.load(std::memory_order_relaxed) == TransportState::Buffering && ShouldStartPlayback()) {
+        transportState_.store(TransportState::Playing, std::memory_order_relaxed);
+    }
+
     return env.Undefined();
 }
 
@@ -252,6 +261,10 @@ Napi::Value AudioPlayer::Write(const Napi::CallbackInfo& info) {
     if (totalWrittenFrames > 0) {
         eos_.store(false, std::memory_order_relaxed);
         endedQueued_.store(false, std::memory_order_relaxed);
+
+        if (transportState_.load(std::memory_order_relaxed) == TransportState::Buffering && ShouldStartPlayback()) {
+            transportState_.store(TransportState::Playing, std::memory_order_relaxed);
+        }
     }
 
     if (totalWrittenFrames < inputFrames) {
@@ -269,11 +282,27 @@ void AudioPlayer::DataCallback(ma_device* pDevice, void* pOutput, const void* pI
     const size_t bytesPerFrame = sizeof(float) * channels;
     ma_uint8* outBytes = reinterpret_cast<ma_uint8*>(pOutput);
 
-    const TransportState state = self->transportState_.load(std::memory_order_relaxed);
-    if (!self->rbInited_.load(std::memory_order_relaxed) || state != TransportState::Playing) {
+    if (!self->rbInited_.load(std::memory_order_relaxed)) {
         ma_silence_pcm_frames(pOutput, frameCount, pDevice->playback.format, channels);
         (void)pInput;
         return;
+    }
+
+    TransportState state = self->transportState_.load(std::memory_order_relaxed);
+    if (state == TransportState::Stopped || state == TransportState::Paused) {
+        ma_silence_pcm_frames(pOutput, frameCount, pDevice->playback.format, channels);
+        (void)pInput;
+        return;
+    }
+
+    if (state == TransportState::Buffering) {
+        if (!self->ShouldStartPlayback()) {
+            ma_silence_pcm_frames(pOutput, frameCount, pDevice->playback.format, channels);
+            (void)pInput;
+            return;
+        }
+
+        self->transportState_.store(TransportState::Playing, std::memory_order_relaxed);
     }
 
     ma_uint32 framesRemaining = frameCount;
@@ -309,6 +338,11 @@ void AudioPlayer::DataCallback(ma_device* pDevice, void* pOutput, const void* pI
             channels
         );
         self->underrunCount_.fetch_add(1, std::memory_order_relaxed);
+
+        // if not EOS, buffer instead of playing repeated small gaps
+        if (!self->eos_.load(std::memory_order_relaxed)) {
+            self->transportState_.store(TransportState::Buffering, std::memory_order_relaxed);
+        }
     }
 
     const ma_uint32 buffered = self->bufferedFrames_.load(std::memory_order_relaxed);
@@ -330,6 +364,17 @@ void AudioPlayer::DataCallback(ma_device* pDevice, void* pOutput, const void* pI
 Napi::Value AudioPlayer::InitDevice(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
 
+    double bufferCapacityMs = 5000.0;
+    double drainLowWaterMs = 500.0;
+    double startThresholdMs = 0.0;
+
+    if (info.Length() >= 1 && info[0].IsObject()) {
+        const Napi::Object opts = info[0].As<Napi::Object>();
+        if (opts.Has("bufferCapacityMs")) bufferCapacityMs = opts.Get("bufferCapacityMs").As<Napi::Number>().DoubleValue();
+        if (opts.Has("drainLowWaterMs")) drainLowWaterMs = opts.Get("drainLowWaterMs").As<Napi::Number>().DoubleValue();
+        if (opts.Has("startThresholdMs")) startThresholdMs = opts.Get("startThresholdMs").As<Napi::Number>().DoubleValue();
+    }
+
     if (deviceInited_.load(std::memory_order_relaxed) || rbInited_.load(std::memory_order_relaxed)) {
         Napi::Error::New(env, "AudioPlayer is already initialized")
             .ThrowAsJavaScriptException();
@@ -340,7 +385,7 @@ Napi::Value AudioPlayer::InitDevice(const Napi::CallbackInfo& info) {
     config.playback.format = ma_format_f32;
     config.playback.channels = 0; // device native
     config.sampleRate = 0; // device native
-    config.dataCallback = AudioPlayer::DataCallback;
+    config.dataCallback = DataCallback;
     config.pUserData = this;
 
     // init the device
@@ -355,10 +400,16 @@ Napi::Value AudioPlayer::InitDevice(const Napi::CallbackInfo& info) {
     sampleRate_ = device_.sampleRate;
     channels_ = device_.playback.channels;
 
-    ringCapacityFrames_ = sampleRate_ * 5;
-    drainLowWaterFrames_ = sampleRate_ / 2;
-    startThresholdFrames_ = sampleRate_ / 4;
+    ringCapacityFrames_ = static_cast<ma_uint32>((sampleRate_ * bufferCapacityMs) / 1000.0);
+    drainLowWaterFrames_ = static_cast<ma_uint32>((sampleRate_ * drainLowWaterMs) / 1000.0);
+    startThresholdFrames_ = static_cast<ma_uint32>((sampleRate_ * startThresholdMs) / 1000.0);
 
+    // safety cases
+    if (ringCapacityFrames_ == 0) ringCapacityFrames_ = sampleRate_ * 5;
+    if (drainLowWaterFrames_ > ringCapacityFrames_) drainLowWaterFrames_ = ringCapacityFrames_;
+    if (startThresholdFrames_ > ringCapacityFrames_) startThresholdFrames_ = ringCapacityFrames_;
+
+    // init the ring buffer
     ma_result rbResult = ma_pcm_rb_init(
         ma_format_f32,
         channels_,
@@ -377,6 +428,7 @@ Napi::Value AudioPlayer::InitDevice(const Napi::CallbackInfo& info) {
     }
     rbInited_.store(true, std::memory_order_relaxed);
 
+    // start the device
     ma_result startResult = ma_device_start(&device_);
     if (startResult != MA_SUCCESS) {
         ma_pcm_rb_uninit(&rb_);
@@ -404,7 +456,11 @@ Napi::Value AudioPlayer::Play(const Napi::CallbackInfo& info) {
         return env.Null();
     }
 
-    transportState_.store(TransportState::Playing, std::memory_order_relaxed);
+    if (ShouldStartPlayback()) {
+        transportState_.store(TransportState::Playing, std::memory_order_relaxed);
+    } else {
+        transportState_.store(TransportState::Buffering, std::memory_order_relaxed);
+    }
     return env.Undefined();
 }
 
@@ -471,11 +527,21 @@ Napi::Value AudioPlayer::GetState(const Napi::CallbackInfo& info) {
 
     const TransportState ts = transportState_.load(std::memory_order_relaxed);
 
-    auto transportStateStr = "stopped";
-    if (ts == TransportState::Playing) {
-        transportStateStr = "playing";
-    } else if (ts == TransportState::Paused) {
-        transportStateStr = "paused";
+
+    std::string transportStateStr;
+    switch (ts) {
+        case TransportState::Stopped:
+            transportStateStr = "stopped";
+            break;
+        case TransportState::Buffering:
+            transportStateStr = "buffering";
+            break;
+        case TransportState::Playing:
+            transportStateStr = "playing";
+            break;
+        case TransportState::Paused:
+            transportStateStr = "paused";
+            break;
     }
     state.Set("transportState", Napi::String::New(env, transportStateStr));
 
@@ -484,6 +550,18 @@ Napi::Value AudioPlayer::GetState(const Napi::CallbackInfo& info) {
 
 Napi::Object InitAll(Napi::Env env, Napi::Object exports) {
     return AudioPlayer::Init(env, exports);
+}
+
+bool AudioPlayer::ShouldStartPlayback() const {
+    const ma_uint32 buffered = bufferedFrames_.load(std::memory_order_relaxed);
+    if (buffered >= startThresholdFrames_) {
+        return true;
+    }
+    if (eos_.load(std::memory_order_relaxed) && buffered > 0) {
+        return true;
+    }
+
+    return false;
 }
 
 NODE_API_MODULE(dodio_audio, InitAll)
