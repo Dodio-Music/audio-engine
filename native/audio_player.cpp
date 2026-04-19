@@ -22,6 +22,7 @@ private:
     Napi::Value Write(const Napi::CallbackInfo& info);
     Napi::Value GetState(const Napi::CallbackInfo& info);
     Napi::Value Pause(const Napi::CallbackInfo& info);
+    Napi::Value Flush(const Napi::CallbackInfo& info);
 
     ma_pcm_rb rb_{};
     bool rbInited_ = false;
@@ -38,7 +39,6 @@ private:
         Paused = 2
     };
     std::atomic<TransportState> transportState_{TransportState::Stopped};
-    std::atomic<bool> initialized_{false};
 
     uint32_t sampleRate_ = 0;
     uint32_t channels_ = 0;
@@ -71,7 +71,7 @@ Napi::Object AudioPlayer::Init(Napi::Env env, Napi::Object exports) {
             InstanceMethod("stop", &AudioPlayer::Stop),
             InstanceMethod("write", &AudioPlayer::Write),
             InstanceMethod("getState", &AudioPlayer::GetState),
-            InstanceMethod("pause", &AudioPlayer::Pause),
+            InstanceMethod("pause", &AudioPlayer::Pause)
         }
     );
 
@@ -85,7 +85,7 @@ Napi::Object AudioPlayer::Init(Napi::Env env, Napi::Object exports) {
 Napi::Value AudioPlayer::Write(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
 
-    if (!initialized_.load(std::memory_order_relaxed) || !rbInited_) {
+    if (!deviceInited_ || !rbInited_) {
         Napi::Error::New(env, "AudioPlayer is not initialized!")
         .ThrowAsJavaScriptException();
         return env.Null();
@@ -135,13 +135,13 @@ void AudioPlayer::DataCallback(ma_device* pDevice, void* pOutput, const void* pI
     auto* self = reinterpret_cast<AudioPlayer*>(pDevice->pUserData);
     if (self == nullptr || pOutput == nullptr) return;
 
-    float* out = reinterpret_cast<float*>(pOutput);
     const ma_uint32 channels = pDevice->playback.channels;
     const size_t bytesPerFrame = sizeof(float) * channels;
+    ma_uint8* outBytes = reinterpret_cast<ma_uint8*>(pOutput);
 
     const TransportState state = self->transportState_.load(std::memory_order_relaxed);
     if (!self->rbInited_ || state != TransportState::Playing) {
-        ma_silence_pcm_frames(out, frameCount, pDevice->playback.format, channels);
+        ma_silence_pcm_frames(pOutput, frameCount, pDevice->playback.format, channels);
         (void)pInput;
         return;
     }
@@ -159,7 +159,7 @@ void AudioPlayer::DataCallback(ma_device* pDevice, void* pOutput, const void* pI
         }
 
         std::memcpy(
-            reinterpret_cast<ma_uint8*>(out) + (totalFramesRead * bytesPerFrame),
+            outBytes + (totalFramesRead * bytesPerFrame),
             src,
             framesToRead * bytesPerFrame
         );
@@ -172,7 +172,7 @@ void AudioPlayer::DataCallback(ma_device* pDevice, void* pOutput, const void* pI
 
     if (framesRemaining > 0) {
         ma_silence_pcm_frames(
-            reinterpret_cast<ma_uint8*>(out) + (totalFramesRead * bytesPerFrame),
+            outBytes + (totalFramesRead * bytesPerFrame),
             framesRemaining,
             pDevice->playback.format,
             channels
@@ -186,6 +186,12 @@ void AudioPlayer::DataCallback(ma_device* pDevice, void* pOutput, const void* pI
 Napi::Value AudioPlayer::InitDevice(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
 
+    if (deviceInited_ || rbInited_) {
+        Napi::Error::New(env, "AudioPlayer is already initialized")
+            .ThrowAsJavaScriptException();
+        return env.Null();
+    }
+
     ma_device_config config = ma_device_config_init(ma_device_type_playback);
     config.playback.format = ma_format_f32;
     config.playback.channels = 0; // device native
@@ -193,6 +199,7 @@ Napi::Value AudioPlayer::InitDevice(const Napi::CallbackInfo& info) {
     config.dataCallback = AudioPlayer::DataCallback;
     config.pUserData = this;
 
+    // init the device
     ma_result result = ma_device_init(nullptr, &config, &device_);
     if (result != MA_SUCCESS) {
         Napi::Error::New(env, "Failed to initialize playback device")
@@ -214,6 +221,9 @@ Napi::Value AudioPlayer::InitDevice(const Napi::CallbackInfo& info) {
         &rb_
     );
     if (rbResult != MA_SUCCESS) {
+        ma_device_uninit(&device_);
+        deviceInited_ = false;
+
         Napi::Error::New(env, "Failed to initialize ring buffer!")
         .ThrowAsJavaScriptException();
         return env.Null();
@@ -222,6 +232,9 @@ Napi::Value AudioPlayer::InitDevice(const Napi::CallbackInfo& info) {
 
     ma_result startResult = ma_device_start(&device_);
     if (startResult != MA_SUCCESS) {
+        ma_pcm_rb_uninit(&rb_);
+        rbInited_ = false;
+
         ma_device_uninit(&device_);
         deviceInited_ = false;
 
@@ -229,7 +242,6 @@ Napi::Value AudioPlayer::InitDevice(const Napi::CallbackInfo& info) {
             .ThrowAsJavaScriptException();
         return env.Null();
     }
-    initialized_.store(true, std::memory_order_relaxed);
     transportState_.store(TransportState::Stopped, std::memory_order_relaxed);
 
     return Napi::Boolean::New(env, true);
@@ -238,7 +250,7 @@ Napi::Value AudioPlayer::InitDevice(const Napi::CallbackInfo& info) {
 Napi::Value AudioPlayer::Play(const Napi::CallbackInfo& info) {
     const Napi::Env env = info.Env();
 
-    if (!initialized_.load(std::memory_order_relaxed) || !deviceInited_) {
+    if (!deviceInited_ || !rbInited_) {
         Napi::Error::New(env, "AudioPlayer is not initialized")
             .ThrowAsJavaScriptException();
         return env.Null();
@@ -251,7 +263,7 @@ Napi::Value AudioPlayer::Play(const Napi::CallbackInfo& info) {
 Napi::Value AudioPlayer::Pause(const Napi::CallbackInfo& info) {
     const Napi::Env env = info.Env();
 
-    if (!initialized_.load(std::memory_order_relaxed) || !deviceInited_) {
+    if (!deviceInited_ || !rbInited_) {
         Napi::Error::New(env, "AudioPlayer is not initialized")
         .ThrowAsJavaScriptException();
         return env.Null();
@@ -262,15 +274,51 @@ Napi::Value AudioPlayer::Pause(const Napi::CallbackInfo& info) {
 }
 
 Napi::Value AudioPlayer::Stop(const Napi::CallbackInfo& info) {
+    return Flush(info);
+}
+
+Napi::Value AudioPlayer::Flush(const Napi::CallbackInfo& info) {
     const Napi::Env env = info.Env();
 
-    if (!initialized_.load(std::memory_order_relaxed) || !deviceInited_) {
+    if (!deviceInited_ || !rbInited_) {
         Napi::Error::New(env, "AudioPlayer is not initialized")
             .ThrowAsJavaScriptException();
         return env.Null();
     }
 
     transportState_.store(TransportState::Stopped, std::memory_order_relaxed);
+
+    ma_result stopResult = ma_device_stop(&device_);
+    if (stopResult != MA_SUCCESS) {
+        Napi::Error::New(env, "Failed to stop playback device for flush")
+            .ThrowAsJavaScriptException();
+        return env.Null();
+    }
+
+    for (;;) {
+        ma_uint32 framesAvailable = ma_pcm_rb_available_read(&rb_);
+        if (framesAvailable == 0) {
+            break;
+        }
+
+        void* src = nullptr;
+        ma_uint32 framesToDiscard = framesAvailable;
+
+        ma_result result = ma_pcm_rb_acquire_read(&rb_, &framesToDiscard, &src);
+        if (result != MA_SUCCESS || framesToDiscard == 0) {
+            break;
+        }
+
+        ma_pcm_rb_commit_read(&rb_, framesToDiscard);
+    }
+
+    ma_result startResult = ma_device_start(&device_);
+    if (startResult != MA_SUCCESS) {
+        Napi::Error::New(env, "Failed to restart playback device after flush")
+            .ThrowAsJavaScriptException();
+        return env.Null();
+    }
+
     return env.Undefined();
 }
 
@@ -278,7 +326,6 @@ Napi::Value AudioPlayer::GetState(const Napi::CallbackInfo& info) {
     const Napi::Env env = info.Env();
 
     const Napi::Object state = Napi::Object::New(env);
-    state.Set("initialized", Napi::Boolean::New(env, initialized_.load()));
     state.Set("sampleRate", Napi::Number::New(env, sampleRate_));
     state.Set("channels", Napi::Number::New(env, channels_));
     state.Set("bufferedFrames", Napi::Number::New(env, rbInited_ ? ma_pcm_rb_available_read(&rb_) : 0));

@@ -1,7 +1,6 @@
 import {Buffer} from "node:buffer";
 
 export interface AudioPlayerState {
-    initialized: boolean;
     sampleRate: number;
     channels: number;
     bufferedFrames: number;
