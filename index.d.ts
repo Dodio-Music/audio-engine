@@ -8,6 +8,7 @@ export interface AudioPlayerState {
     underrunCount: number;
     eos: boolean;
     transportState: "stopped" | "buffering" | "playing" | "paused";
+    volume: boolean;
 }
 
 export class AudioPlayer {
@@ -26,6 +27,7 @@ export class AudioPlayer {
     endOfStream(): void;
     setDrainCallback(callback: () => void): void;
     setEndedCallback(callback: () => void): void;
+    setVolume(volume: number): void;
 }
 
 declare const _default: {

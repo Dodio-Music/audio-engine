@@ -24,6 +24,7 @@ private:
     Napi::Value Pause(const Napi::CallbackInfo& info);
     Napi::Value Flush(const Napi::CallbackInfo& info);
     Napi::Value EndOfStream(const Napi::CallbackInfo& info);
+    Napi::Value SetVolume(const Napi::CallbackInfo& info);
 
     ma_pcm_rb rb_{};
     std::atomic<bool> rbInited_{false};
@@ -109,7 +110,8 @@ Napi::Object AudioPlayer::Init(Napi::Env env, Napi::Object exports) {
             InstanceMethod("flush", &AudioPlayer::Flush),
             InstanceMethod("endOfStream", &AudioPlayer::EndOfStream),
             InstanceMethod("setDrainCallback", &AudioPlayer::SetDrainCallback),
-            InstanceMethod("setEndedCallback", &AudioPlayer::SetEndedCallback)
+            InstanceMethod("setEndedCallback", &AudioPlayer::SetEndedCallback),
+            InstanceMethod("setVolume", &AudioPlayer::SetVolume)
         }
     );
 
@@ -151,6 +153,38 @@ Napi::Value AudioPlayer::SetEndedCallback(const Napi::CallbackInfo& info) {
 
     endedTsfn_ = Napi::ThreadSafeFunction::New(env, info[0].As<Napi::Function>(), "AudioPlayerEnded", 0, 1);
     endedTsfn_.Unref(env);
+    return env.Undefined();
+}
+
+Napi::Value AudioPlayer::SetVolume(const Napi::CallbackInfo& info) {
+    const Napi::Env env = info.Env();
+
+    if (!deviceInited_.load(std::memory_order_relaxed)) {
+        Napi::Error::New(env, "AudioPlayer is not initialized")
+            .ThrowAsJavaScriptException();
+        return env.Null();
+    }
+
+    if (info.Length() < 1 || !info[0].IsNumber()) {
+        Napi::TypeError::New(env, "Expected number")
+            .ThrowAsJavaScriptException();
+        return env.Null();
+    }
+
+    const float volume = info[0].As<Napi::Number>().FloatValue();
+    if (volume < 0.0f || volume > 1.0f) {
+        Napi::RangeError::New(env, "Volume must be float between 0 and 1")
+            .ThrowAsJavaScriptException();
+        return env.Null();
+    }
+
+    const ma_result result = ma_device_set_master_volume(&device_, volume);
+    if (result != MA_SUCCESS) {
+        Napi::Error::New(env, "Failed to set device volume")
+            .ThrowAsJavaScriptException();
+        return env.Null();
+    }
+
     return env.Undefined();
 }
 
@@ -524,6 +558,10 @@ Napi::Value AudioPlayer::GetState(const Napi::CallbackInfo& info) {
     state.Set("bufferCapacityFrames", Napi::Number::New(env, ringCapacityFrames_));
     state.Set("underrunCount", Napi::Number::New(env, underrunCount_.load()));
     state.Set("eos", Napi::Boolean::New(env, eos_.load(std::memory_order_relaxed)));
+
+    float volume = 1.0f;
+    if (deviceInited_.load(std::memory_order_relaxed)) ma_device_get_master_volume(&device_, &volume);
+    state.Set("volume", Napi::Number::New(env, volume));
 
     const TransportState ts = transportState_.load(std::memory_order_relaxed);
 
