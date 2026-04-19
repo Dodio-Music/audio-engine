@@ -9,6 +9,8 @@ export interface AudioPlayerState {
     eos: boolean;
     transportState: "stopped" | "buffering" | "playing" | "paused";
     volume: boolean;
+    songFramesPlayed: number;
+    songFramesWritten: number;
 }
 
 export class AudioPlayer {

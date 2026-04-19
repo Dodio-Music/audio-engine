@@ -55,7 +55,7 @@ private:
 
     ma_uint32 ringCapacityFrames_ = 0;
     ma_uint32 drainLowWaterFrames_ = 0;
-    ma_uint32 startThresholdFrames_ = 0; // TODO: implement buffering
+    ma_uint32 startThresholdFrames_ = 0;
 
     Napi::ThreadSafeFunction drainTsfn_;
     Napi::ThreadSafeFunction endedTsfn_;
@@ -67,6 +67,9 @@ private:
     void QueueEndedEvent();
 
     bool ShouldStartPlayback() const;
+
+    std::atomic<uint64_t> pcmFramesPlayed_{0};
+    std::atomic<uint64_t> pcmFramesWritten_{0};
 };
 
 Napi::FunctionReference AudioPlayer::constructor;
@@ -288,6 +291,7 @@ Napi::Value AudioPlayer::Write(const Napi::CallbackInfo& info) {
 
         ma_pcm_rb_commit_write(&rb_, framesToWrite);
         bufferedFrames_.fetch_add(framesToWrite, std::memory_order_relaxed);
+        pcmFramesWritten_.fetch_add(framesToWrite, std::memory_order_relaxed);
 
         totalWrittenFrames += framesToWrite;
     }
@@ -359,6 +363,7 @@ void AudioPlayer::DataCallback(ma_device* pDevice, void* pOutput, const void* pI
 
         ma_pcm_rb_commit_read(&self->rb_, framesToRead);
         self->bufferedFrames_.fetch_sub(framesToRead, std::memory_order_relaxed);
+        self->pcmFramesPlayed_.fetch_add(framesToRead, std::memory_order_relaxed);
 
         totalFramesRead += framesToRead;
         framesRemaining -= framesToRead;
@@ -530,6 +535,9 @@ Napi::Value AudioPlayer::Flush(const Napi::CallbackInfo& info) {
     drainQueued_.store(false, std::memory_order_relaxed);
     endedQueued_.store(false, std::memory_order_relaxed);
 
+    pcmFramesPlayed_.store(0, std::memory_order_relaxed);
+    pcmFramesWritten_.store(0, std::memory_order_relaxed);
+
     if (ma_device_stop(&device_) != MA_SUCCESS) {
         Napi::Error::New(env, "Failed to stop playback device")
             .ThrowAsJavaScriptException();
@@ -563,9 +571,12 @@ Napi::Value AudioPlayer::GetState(const Napi::CallbackInfo& info) {
     if (deviceInited_.load(std::memory_order_relaxed)) ma_device_get_master_volume(&device_, &volume);
     state.Set("volume", Napi::Number::New(env, volume));
 
+    const uint64_t playedFrames = pcmFramesPlayed_.load(std::memory_order_relaxed);
+    const uint64_t writtenFrames = pcmFramesWritten_.load(std::memory_order_relaxed);
+    state.Set("songFramesPlayed", Napi::Number::New(env, static_cast<double>(playedFrames)));
+    state.Set("songFramesWritten", Napi::Number::New(env, static_cast<double>(writtenFrames)));
+
     const TransportState ts = transportState_.load(std::memory_order_relaxed);
-
-
     std::string transportStateStr;
     switch (ts) {
         case TransportState::Stopped:
