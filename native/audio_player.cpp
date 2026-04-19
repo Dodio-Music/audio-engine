@@ -1,10 +1,6 @@
 #include <napi.h>
 #include <atomic>
-#include <cmath>
-#include <condition_variable>
-#include <deque>
-#include <thread>
-#include <vector>
+#include <cstring>
 
 #define MINIAUDIO_IMPLEMENTATION
 #include "miniaudio.h"
@@ -27,17 +23,15 @@ private:
     Napi::Value GetState(const Napi::CallbackInfo& info);
     Napi::Value Pause(const Napi::CallbackInfo& info);
     Napi::Value Flush(const Napi::CallbackInfo& info);
-
-    void FeederLoop();
+    Napi::Value EndOfStream(const Napi::CallbackInfo& info);
 
     ma_pcm_rb rb_{};
-    bool rbInited_ = false;
+    std::atomic<bool> rbInited_{false};
 
     std::atomic<uint64_t> underrunCount_{0};
-    ma_uint32 bufferFrameCapacity = 0;
 
     ma_device device_{};
-    bool deviceInited_ = false;
+    std::atomic<bool> deviceInited_{false};
 
     enum class TransportState : uint32_t {
         Stopped = 0,
@@ -49,16 +43,26 @@ private:
     uint32_t sampleRate_ = 0;
     uint32_t channels_ = 0;
 
-    std::mutex queueMutex_;
-    std::condition_variable queueCv_;
-    std::deque<std::vector<uint8_t>> pcmQueue_;
-    size_t queueReadOffset_ = 0;
-    size_t queuedBytes_ = 0;
-    size_t maxQueuedBytes_ = 0;
+    std::atomic<ma_uint32> bufferedFrames_{0};
 
     std::atomic<bool> eos_{false};
-    std::atomic<bool> shuttingDown_{false};
-    std::thread feederThread_;
+
+    std::atomic<bool> needsDrain_{false};
+    std::atomic<bool> drainQueued_{false};
+    std::atomic<bool> endedQueued_{false};
+
+    ma_uint32 ringCapacityFrames_ = 0;
+    ma_uint32 drainLowWaterFrames_ = 0;
+    ma_uint32 startThresholdFrames_ = 0; // TODO: implement buffering
+
+    Napi::ThreadSafeFunction drainTsfn_;
+    Napi::ThreadSafeFunction endedTsfn_;
+
+    Napi::Value SetDrainCallback(const Napi::CallbackInfo& info);
+    Napi::Value SetEndedCallback(const Napi::CallbackInfo& info);
+
+    void QueueDrainEvent();
+    void QueueEndedEvent();
 };
 
 Napi::FunctionReference AudioPlayer::constructor;
@@ -66,22 +70,25 @@ Napi::FunctionReference AudioPlayer::constructor;
 AudioPlayer::AudioPlayer(const Napi::CallbackInfo& info) : Napi::ObjectWrap<AudioPlayer>(info) {}
 
 AudioPlayer::~AudioPlayer() {
-    shuttingDown_.store(true, std::memory_order_relaxed);
-    queueCv_.notify_all();
-
-    if (feederThread_.joinable()) {
-        feederThread_.join();
-    }
-
-    if (deviceInited_) {
+    if (deviceInited_.load(std::memory_order_relaxed)) {
         ma_device_stop(&device_);
         ma_device_uninit(&device_);
-        deviceInited_ = false;
+        deviceInited_.store(false, std::memory_order_relaxed);
     }
 
-    if (rbInited_) {
+    if (rbInited_.load(std::memory_order_relaxed)) {
         ma_pcm_rb_uninit(&rb_);
-        rbInited_ = false;
+        rbInited_.store(false, std::memory_order_relaxed);
+    }
+
+    if (drainTsfn_) {
+        drainTsfn_.Abort();
+        drainTsfn_.Release();
+    }
+
+    if (endedTsfn_) {
+        endedTsfn_.Abort();
+        endedTsfn_.Release();
     }
 }
 
@@ -96,7 +103,10 @@ Napi::Object AudioPlayer::Init(Napi::Env env, Napi::Object exports) {
             InstanceMethod("write", &AudioPlayer::Write),
             InstanceMethod("getState", &AudioPlayer::GetState),
             InstanceMethod("pause", &AudioPlayer::Pause),
-            InstanceMethod("flush", &AudioPlayer::Flush)
+            InstanceMethod("flush", &AudioPlayer::Flush),
+            InstanceMethod("endOfStream", &AudioPlayer::EndOfStream),
+            InstanceMethod("setDrainCallback", &AudioPlayer::SetDrainCallback),
+            InstanceMethod("setEndedCallback", &AudioPlayer::SetEndedCallback)
         }
     );
 
@@ -107,11 +117,93 @@ Napi::Object AudioPlayer::Init(Napi::Env env, Napi::Object exports) {
     return exports;
 }
 
+Napi::Value AudioPlayer::SetDrainCallback(const Napi::CallbackInfo& info) {
+    const Napi::Env env = info.Env();
+    if (info.Length() < 1 || !info[0].IsFunction()) {
+        Napi::TypeError::New(env, "Expected a function")
+            .ThrowAsJavaScriptException();
+        return env.Null();
+    }
+    if (drainTsfn_) {
+        drainTsfn_.Abort();
+        drainTsfn_.Release();
+    }
+
+    drainTsfn_ = Napi::ThreadSafeFunction::New(env,info[0].As<Napi::Function>(),"AudioPlayerDrain",0,1);
+    drainTsfn_.Unref(env);
+    return env.Undefined();
+}
+
+Napi::Value AudioPlayer::SetEndedCallback(const Napi::CallbackInfo& info) {
+    const Napi::Env env = info.Env();
+    if (info.Length() < 1 || !info[0].IsFunction()) {
+        Napi::TypeError::New(env, "Expected a function")
+            .ThrowAsJavaScriptException();
+        return env.Null();
+    }
+    if (endedTsfn_) {
+        endedTsfn_.Abort();
+        endedTsfn_.Release();
+    }
+
+    endedTsfn_ = Napi::ThreadSafeFunction::New(env, info[0].As<Napi::Function>(), "AudioPlayerEnded", 0, 1);
+    endedTsfn_.Unref(env);
+    return env.Undefined();
+}
+
+void AudioPlayer::QueueDrainEvent() {
+    if (!drainTsfn_) return;
+
+    if (drainQueued_.exchange(true, std::memory_order_relaxed)) {
+        return;
+    }
+
+    napi_status status = drainTsfn_.NonBlockingCall(
+        [this](Napi::Env env, Napi::Function cb) {
+            drainQueued_.store(false, std::memory_order_relaxed);
+            cb.Call({});
+        }
+    );
+
+    if (status != napi_ok) {
+        drainQueued_.store(false, std::memory_order_relaxed);
+    }
+}
+
+void AudioPlayer::QueueEndedEvent() {
+    if (!endedTsfn_) return;
+    if (endedQueued_.exchange(true, std::memory_order_relaxed)) {
+        return;
+    }
+
+    const napi_status status = endedTsfn_.NonBlockingCall(
+        [this](Napi::Env env, const Napi::Function cb) {
+            cb.Call({});
+        }
+    );
+    if (status != napi_ok) {
+        endedQueued_.store(false, std::memory_order_relaxed);
+    }
+}
+
+Napi::Value AudioPlayer::EndOfStream(const Napi::CallbackInfo& info) {
+    const Napi::Env env = info.Env();
+
+    if (!deviceInited_.load(std::memory_order_relaxed) || !rbInited_.load(std::memory_order_relaxed)) {
+        Napi::Error::New(env, "AudioPlayer is not initialized")
+            .ThrowAsJavaScriptException();
+        return env.Null();
+    }
+
+    eos_.store(true, std::memory_order_relaxed);
+    return env.Undefined();
+}
+
 Napi::Value AudioPlayer::Write(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
 
-    if (!deviceInited_ || !rbInited_) {
-        Napi::Error::New(env, "AudioPlayer is not initialized!")
+    if (!deviceInited_.load(std::memory_order_relaxed) || !rbInited_.load(std::memory_order_relaxed)) {
+        Napi::Error::New(env, "AudioPlayer is not initialized")
         .ThrowAsJavaScriptException();
         return env.Null();
     }
@@ -131,29 +223,42 @@ Napi::Value AudioPlayer::Write(const Napi::CallbackInfo& info) {
         return env.Null();
     }
 
-    size_t acceptedBytes = 0;
+    const ma_uint32 inputFrames = static_cast<ma_uint32>(buffer.Length() / bytesPerFrame);
 
-    {
-        std::lock_guard lock(queueMutex_);
+    ma_uint32 totalWrittenFrames = 0;
+    const uint8_t* srcBytes = buffer.Data();
 
-        const size_t availableBytes = (queuedBytes_ >= maxQueuedBytes_) ? 0 : (maxQueuedBytes_ - queuedBytes_);
-        acceptedBytes = std::min(buffer.Length(), availableBytes);
+    while (totalWrittenFrames < inputFrames) {
+        ma_uint32 framesToWrite = inputFrames - totalWrittenFrames;
+        void* dst = nullptr;
 
-        acceptedBytes -= (acceptedBytes % bytesPerFrame);
-
-        if (acceptedBytes > 0) {
-            std::vector<uint8_t> chunk(acceptedBytes);
-            std::memcpy(chunk.data(), buffer.Data(), acceptedBytes);
-            pcmQueue_.push_back(std::move(chunk));
-            queuedBytes_ += acceptedBytes;
+        ma_result result = ma_pcm_rb_acquire_write(&rb_, &framesToWrite, &dst);
+        if (result != MA_SUCCESS || framesToWrite == 0) {
+            break;
         }
+
+        std::memcpy(
+            dst,
+            srcBytes + (static_cast<size_t>(totalWrittenFrames) * bytesPerFrame),
+            static_cast<size_t>(framesToWrite) * bytesPerFrame
+        );
+
+        ma_pcm_rb_commit_write(&rb_, framesToWrite);
+        bufferedFrames_.fetch_add(framesToWrite, std::memory_order_relaxed);
+
+        totalWrittenFrames += framesToWrite;
     }
 
-    if (acceptedBytes > 0) {
-        queueCv_.notify_one();
+    if (totalWrittenFrames > 0) {
+        eos_.store(false, std::memory_order_relaxed);
+        endedQueued_.store(false, std::memory_order_relaxed);
     }
 
-    return Napi::Number::New(env, acceptedBytes / bytesPerFrame);
+    if (totalWrittenFrames < inputFrames) {
+        needsDrain_.store(true, std::memory_order_relaxed);
+    }
+
+    return Napi::Number::New(env, totalWrittenFrames);
 }
 
 void AudioPlayer::DataCallback(ma_device* pDevice, void* pOutput, const void* pInput, ma_uint32 frameCount) {
@@ -165,7 +270,7 @@ void AudioPlayer::DataCallback(ma_device* pDevice, void* pOutput, const void* pI
     ma_uint8* outBytes = reinterpret_cast<ma_uint8*>(pOutput);
 
     const TransportState state = self->transportState_.load(std::memory_order_relaxed);
-    if (!self->rbInited_ || state != TransportState::Playing) {
+    if (!self->rbInited_.load(std::memory_order_relaxed) || state != TransportState::Playing) {
         ma_silence_pcm_frames(pOutput, frameCount, pDevice->playback.format, channels);
         (void)pInput;
         return;
@@ -190,6 +295,7 @@ void AudioPlayer::DataCallback(ma_device* pDevice, void* pOutput, const void* pI
         );
 
         ma_pcm_rb_commit_read(&self->rb_, framesToRead);
+        self->bufferedFrames_.fetch_sub(framesToRead, std::memory_order_relaxed);
 
         totalFramesRead += framesToRead;
         framesRemaining -= framesToRead;
@@ -205,13 +311,26 @@ void AudioPlayer::DataCallback(ma_device* pDevice, void* pOutput, const void* pI
         self->underrunCount_.fetch_add(1, std::memory_order_relaxed);
     }
 
+    const ma_uint32 buffered = self->bufferedFrames_.load(std::memory_order_relaxed);
+
+    if (self->needsDrain_.load(std::memory_order_relaxed) &&
+        buffered <= self->drainLowWaterFrames_) {
+        self->needsDrain_.store(false, std::memory_order_relaxed);
+        self->QueueDrainEvent();
+    }
+
+    if (self->eos_.load(std::memory_order_relaxed) &&
+        buffered == 0) {
+        self->QueueEndedEvent();
+    }
+
     (void)pInput;
 }
 
 Napi::Value AudioPlayer::InitDevice(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
 
-    if (deviceInited_ || rbInited_) {
+    if (deviceInited_.load(std::memory_order_relaxed) || rbInited_.load(std::memory_order_relaxed)) {
         Napi::Error::New(env, "AudioPlayer is already initialized")
             .ThrowAsJavaScriptException();
         return env.Null();
@@ -232,57 +351,46 @@ Napi::Value AudioPlayer::InitDevice(const Napi::CallbackInfo& info) {
         return env.Null();
     }
 
-    deviceInited_ = true;
+    deviceInited_.store(true, std::memory_order_relaxed);
     sampleRate_ = device_.sampleRate;
     channels_ = device_.playback.channels;
 
-    bufferFrameCapacity = sampleRate_ * 2;
+    ringCapacityFrames_ = sampleRate_ * 5;
+    drainLowWaterFrames_ = sampleRate_ / 2;
+    startThresholdFrames_ = sampleRate_ / 4;
+
     ma_result rbResult = ma_pcm_rb_init(
         ma_format_f32,
         channels_,
-        bufferFrameCapacity,
+        ringCapacityFrames_,
         nullptr,
         nullptr,
         &rb_
     );
     if (rbResult != MA_SUCCESS) {
         ma_device_uninit(&device_);
-        deviceInited_ = false;
+        deviceInited_.store(false, std::memory_order_relaxed);
 
         Napi::Error::New(env, "Failed to initialize ring buffer!")
         .ThrowAsJavaScriptException();
         return env.Null();
     }
-    rbInited_ = true;
+    rbInited_.store(true, std::memory_order_relaxed);
 
     ma_result startResult = ma_device_start(&device_);
     if (startResult != MA_SUCCESS) {
         ma_pcm_rb_uninit(&rb_);
-        rbInited_ = false;
+        rbInited_.store(false, std::memory_order_relaxed);
 
         ma_device_uninit(&device_);
-        deviceInited_ = false;
+        deviceInited_.store(false, std::memory_order_relaxed);
 
         Napi::Error::New(env, "Failed to start playback device")
             .ThrowAsJavaScriptException();
         return env.Null();
     }
     transportState_.store(TransportState::Stopped, std::memory_order_relaxed);
-
-    {
-        std::lock_guard<std::mutex> lock(queueMutex_);
-        pcmQueue_.clear();
-        queueReadOffset_ = 0;
-        queuedBytes_ = 0;
-    }
-
-    maxQueuedBytes_ = static_cast<size_t>(sampleRate_) * channels_ * sizeof(float) * 5; // 5 sec
     eos_.store(false, std::memory_order_relaxed);
-    shuttingDown_.store(false, std::memory_order_relaxed);
-
-    feederThread_ = std::thread([this]() {
-        this->FeederLoop();
-    });
 
     return Napi::Boolean::New(env, true);
 }
@@ -290,21 +398,20 @@ Napi::Value AudioPlayer::InitDevice(const Napi::CallbackInfo& info) {
 Napi::Value AudioPlayer::Play(const Napi::CallbackInfo& info) {
     const Napi::Env env = info.Env();
 
-    if (!deviceInited_ || !rbInited_) {
+    if (!deviceInited_.load(std::memory_order_relaxed) || !rbInited_.load(std::memory_order_relaxed)) {
         Napi::Error::New(env, "AudioPlayer is not initialized")
             .ThrowAsJavaScriptException();
         return env.Null();
     }
 
     transportState_.store(TransportState::Playing, std::memory_order_relaxed);
-    queueCv_.notify_one();
     return env.Undefined();
 }
 
 Napi::Value AudioPlayer::Pause(const Napi::CallbackInfo& info) {
     const Napi::Env env = info.Env();
 
-    if (!deviceInited_ || !rbInited_) {
+    if (!deviceInited_.load(std::memory_order_relaxed) || !rbInited_.load(std::memory_order_relaxed)) {
         Napi::Error::New(env, "AudioPlayer is not initialized")
         .ThrowAsJavaScriptException();
         return env.Null();
@@ -321,7 +428,7 @@ Napi::Value AudioPlayer::Stop(const Napi::CallbackInfo& info) {
 Napi::Value AudioPlayer::Flush(const Napi::CallbackInfo& info) {
     const Napi::Env env = info.Env();
 
-    if (!deviceInited_ || !rbInited_) {
+    if (!deviceInited_.load(std::memory_order_relaxed) || !rbInited_.load(std::memory_order_relaxed)) {
         Napi::Error::New(env, "AudioPlayer is not initialized")
             .ThrowAsJavaScriptException();
         return env.Null();
@@ -329,119 +436,37 @@ Napi::Value AudioPlayer::Flush(const Napi::CallbackInfo& info) {
 
     transportState_.store(TransportState::Stopped, std::memory_order_relaxed);
     eos_.store(false, std::memory_order_relaxed);
+    needsDrain_.store(false, std::memory_order_relaxed);
+    drainQueued_.store(false, std::memory_order_relaxed);
+    endedQueued_.store(false, std::memory_order_relaxed);
 
-    {
-        std::lock_guard<std::mutex> lock(queueMutex_);
-        pcmQueue_.clear();
-        queueReadOffset_ = 0;
-        queuedBytes_ = 0;
+    if (ma_device_stop(&device_) != MA_SUCCESS) {
+        Napi::Error::New(env, "Failed to stop playback device")
+            .ThrowAsJavaScriptException();
+        return env.Null();
     }
 
-    for (;;) {
-        ma_uint32 framesAvailable = ma_pcm_rb_available_read(&rb_);
-        if (framesAvailable == 0) {
-            break;
-        }
+    ma_pcm_rb_reset(&rb_);
+    bufferedFrames_.store(0, std::memory_order_relaxed);
 
-        void* src = nullptr;
-        ma_uint32 framesToDiscard = framesAvailable;
-
-        ma_result result = ma_pcm_rb_acquire_read(&rb_, &framesToDiscard, &src);
-        if (result != MA_SUCCESS || framesToDiscard == 0) {
-            break;
-        }
-
-        ma_pcm_rb_commit_read(&rb_, framesToDiscard);
+    if (ma_device_start(&device_) != MA_SUCCESS) {
+        Napi::Error::New(env, "Failed to restart playback device")
+            .ThrowAsJavaScriptException();
+        return env.Null();
     }
 
-    queueCv_.notify_one();
     return env.Undefined();
-}
-
-void AudioPlayer::FeederLoop() {
-    const size_t bytesPerFrame = sizeof(float) * channels_;
-
-    for (;;) {
-        std::unique_lock<std::mutex> lock(queueMutex_);
-
-        queueCv_.wait(lock, [this]() {
-            return shuttingDown_.load(std::memory_order_relaxed) || !pcmQueue_.empty();
-        });
-
-        if (shuttingDown_.load(std::memory_order_relaxed)) {
-            break;
-        }
-
-        while (!pcmQueue_.empty()) {
-            ma_uint32 availableWriteFrames = ma_pcm_rb_available_write(&rb_);
-            if (availableWriteFrames == 0) {
-                break;
-            }
-
-            std::vector<uint8_t>& front = pcmQueue_.front();
-
-            const size_t remainingBytes = front.size() - queueReadOffset_;
-            const ma_uint32 availableChunkFrames = static_cast<ma_uint32>(remainingBytes / bytesPerFrame);
-
-            if (availableChunkFrames == 0) {
-                pcmQueue_.pop_front();
-                queueReadOffset_ = 0;
-                continue;
-            }
-
-            ma_uint32 framesToWrite = std::min(availableWriteFrames, availableChunkFrames);
-
-            void* dst = nullptr;
-            ma_uint32 acquiredFrames = framesToWrite;
-
-            ma_result result = ma_pcm_rb_acquire_write(&rb_, &acquiredFrames, &dst);
-            if (result != MA_SUCCESS || acquiredFrames == 0) {
-                break;
-            }
-
-            const size_t bytesToWrite = static_cast<size_t>(acquiredFrames) * bytesPerFrame;
-
-            std::memcpy(
-                dst,
-                front.data() + queueReadOffset_,
-                bytesToWrite
-            );
-
-            ma_pcm_rb_commit_write(&rb_, acquiredFrames);
-
-            queueReadOffset_ += bytesToWrite;
-            queuedBytes_ -= bytesToWrite;
-
-            if (queueReadOffset_ >= front.size()) {
-                pcmQueue_.pop_front();
-                queueReadOffset_ = 0;
-            }
-        }
-
-        lock.unlock();
-
-        // fixme: notify when ringbuffer space opens up (so i don't have to retry in 2ms)
-        std::this_thread::sleep_for(std::chrono::milliseconds(2));
-    }
 }
 
 Napi::Value AudioPlayer::GetState(const Napi::CallbackInfo& info) {
     const Napi::Env env = info.Env();
 
-    size_t queuedBytesSnapshot = 0;
-    {
-        std::lock_guard lock(queueMutex_);
-        queuedBytesSnapshot = queuedBytes_;
-    }
-
     const Napi::Object state = Napi::Object::New(env);
     state.Set("sampleRate", Napi::Number::New(env, sampleRate_));
     state.Set("channels", Napi::Number::New(env, channels_));
-    state.Set("bufferedFrames", Napi::Number::New(env, rbInited_ ? ma_pcm_rb_available_read(&rb_) : 0));
+    state.Set("bufferedFrames", Napi::Number::New(env,bufferedFrames_.load(std::memory_order_relaxed)));
+    state.Set("bufferCapacityFrames", Napi::Number::New(env, ringCapacityFrames_));
     state.Set("underrunCount", Napi::Number::New(env, underrunCount_.load()));
-    state.Set("queuedBytes", Napi::Number::New(env, queuedBytesSnapshot));
-    state.Set("queueCapacityBytes", Napi::Number::New(env, maxQueuedBytes_));
-    state.Set("queuedFrames", Napi::Number::New(env, channels_ > 0 ? queuedBytesSnapshot / (sizeof(float) * channels_) : 0));
     state.Set("eos", Napi::Boolean::New(env, eos_.load(std::memory_order_relaxed)));
 
     const TransportState ts = transportState_.load(std::memory_order_relaxed);

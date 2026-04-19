@@ -1,13 +1,11 @@
-import {Buffer} from "node:buffer";
+import { Buffer } from "node:buffer";
 
 export interface AudioPlayerState {
     sampleRate: number;
     channels: number;
     bufferedFrames: number;
+    bufferCapacityFrames: number;
     underrunCount: number;
-    queuedBytes: number;
-    queueCapacityBytes: number;
-    queuedFrames: number;
     eos: boolean;
     transportState: "stopped" | "playing" | "paused";
 }
@@ -21,6 +19,9 @@ export class AudioPlayer {
     getState(): AudioPlayerState;
     pause(): void;
     flush(): void;
+    endOfStream(): void;
+    setDrainCallback(callback: () => void): void;
+    setEndedCallback(callback: () => void): void;
 }
 
 declare const _default: {
