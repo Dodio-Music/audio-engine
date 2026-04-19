@@ -5,6 +5,10 @@ export interface AudioPlayerState {
     channels: number;
     bufferedFrames: number;
     underrunCount: number;
+    queuedBytes: number;
+    queueCapacityBytes: number;
+    queuedFrames: number;
+    eos: boolean;
     transportState: "stopped" | "playing" | "paused";
 }
 
@@ -16,6 +20,7 @@ export class AudioPlayer {
     write(buffer: Buffer): number;
     getState(): AudioPlayerState;
     pause(): void;
+    flush(): void;
 }
 
 declare const _default: {
