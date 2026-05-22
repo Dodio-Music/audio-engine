@@ -18,6 +18,7 @@ private:
     Napi::Value Resume(const Napi::CallbackInfo& info);
     Napi::Value TogglePlayPause(const Napi::CallbackInfo& info);
     Napi::Value Seek(const Napi::CallbackInfo& info);
+    Napi::Value SetVolume(const Napi::CallbackInfo& info);
 
     void Cleanup();
 
@@ -30,6 +31,7 @@ private:
     bool deviceInitialized = false;
 
     bool playing = false;
+    float volume = 1.0f;
 
     std::atomic<bool> seekRequested = false;
     std::atomic<ma_uint64> seekTargetFrame = 0;
@@ -58,7 +60,8 @@ Napi::Object AudioPlayer::Init(Napi::Env env, Napi::Object exports) {
             InstanceMethod("pause", &AudioPlayer::Pause),
             InstanceMethod("resume", &AudioPlayer::Resume),
             InstanceMethod("togglePlayPause", &AudioPlayer::TogglePlayPause),
-            InstanceMethod("seek", &AudioPlayer::Seek)
+            InstanceMethod("seek", &AudioPlayer::Seek),
+            InstanceMethod("setVolume", &AudioPlayer::SetVolume)
         }
     );
 
@@ -111,6 +114,25 @@ Napi::Value AudioPlayer::Seek(const Napi::CallbackInfo &info) {
 
     seekTargetFrame.store(frame, std::memory_order_relaxed);
     seekRequested.store(true, std::memory_order_relaxed);
+
+    return env.Undefined();
+}
+
+Napi::Value AudioPlayer::SetVolume(const Napi::CallbackInfo& info) {
+    const auto env = info.Env();
+    if (info.Length() < 1 || !info[0].IsNumber()) {
+        Napi::TypeError::New(env, "Expected volume number.").ThrowAsJavaScriptException();
+        return env.Null();
+    }
+    float value = info[0].As<Napi::Number>().FloatValue();
+    if (value < 0.0f) value = 0.0f;
+    if (value > 1.0f) value = 1.0f;
+
+    volume = value;
+
+    if (deviceInitialized) {
+        ma_device_set_master_volume(&device, value);
+    }
 
     return env.Undefined();
 }
@@ -213,6 +235,8 @@ Napi::Value AudioPlayer::Load(const Napi::CallbackInfo& info) {
         return env.Null();
     }
     deviceInitialized = true;
+
+    ma_device_set_master_volume(&device, volume);
 
     result = ma_device_start(&device);
     if (result != MA_SUCCESS) {

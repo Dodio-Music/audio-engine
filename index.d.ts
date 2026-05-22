@@ -20,9 +20,9 @@ export class AudioPlayer {
     resume(): void;
     togglePlayPause(): boolean;
     seek(timeSeconds: number): void;
+    setVolume(volume: number): void;
 
     getState(): AudioPlayerState;
-    setVolume(volume: number): void;
 }
 
 declare const _default: {
