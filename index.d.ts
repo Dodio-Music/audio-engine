@@ -19,8 +19,9 @@ export class AudioPlayer {
     pause(): void;
     resume(): void;
     togglePlayPause(): boolean;
+    seek(timeSeconds: number): void;
+
     getState(): AudioPlayerState;
-    pause(): void;
     setVolume(volume: number): void;
 }
 

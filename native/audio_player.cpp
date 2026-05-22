@@ -1,5 +1,6 @@
 #include <napi.h>
 #include <cstring>
+#include <atomic>
 
 #define MINIAUDIO_IMPLEMENTATION
 #include "miniaudio.h"
@@ -16,6 +17,7 @@ private:
     Napi::Value Pause(const Napi::CallbackInfo& info);
     Napi::Value Resume(const Napi::CallbackInfo& info);
     Napi::Value TogglePlayPause(const Napi::CallbackInfo& info);
+    Napi::Value Seek(const Napi::CallbackInfo& info);
 
     void Cleanup();
 
@@ -28,6 +30,9 @@ private:
     bool deviceInitialized = false;
 
     bool playing = false;
+
+    std::atomic<bool> seekRequested = false;
+    std::atomic<ma_uint64> seekTargetFrame = 0;
 };
 
 Napi::FunctionReference AudioPlayer::constructor;
@@ -52,7 +57,8 @@ Napi::Object AudioPlayer::Init(Napi::Env env, Napi::Object exports) {
             InstanceMethod("load", &AudioPlayer::Load),
             InstanceMethod("pause", &AudioPlayer::Pause),
             InstanceMethod("resume", &AudioPlayer::Resume),
-            InstanceMethod("togglePlayPause", &AudioPlayer::TogglePlayPause)
+            InstanceMethod("togglePlayPause", &AudioPlayer::TogglePlayPause),
+            InstanceMethod("seek", &AudioPlayer::Seek)
         }
     );
 
@@ -80,14 +86,33 @@ void AudioPlayer::DataCallback(ma_device* pDevice, void* pOutput, const void* pI
         return;
     }
 
+    if (player->seekRequested.exchange(false, std::memory_order_acquire)) {
+        ma_decoder_seek_to_pcm_frame(
+            &player->decoder,
+            player->seekTargetFrame.load(std::memory_order_relaxed)
+        );
+    }
+
+    ma_uint64 framesRead = 0;
     ma_decoder_read_pcm_frames(
         &player->decoder,
         pOutput,
         frameCount,
-        nullptr
+        &framesRead
     );
 
     (void)pInput;
+}
+
+Napi::Value AudioPlayer::Seek(const Napi::CallbackInfo &info) {
+    const auto env = info.Env();
+    const double seconds = info[0].As<Napi::Number>().DoubleValue();
+    const auto frame = static_cast<ma_uint64>(seconds * decoder.outputSampleRate);
+
+    seekTargetFrame.store(frame, std::memory_order_relaxed);
+    seekRequested.store(true, std::memory_order_relaxed);
+
+    return env.Undefined();
 }
 
 void AudioPlayer::Cleanup() {
@@ -150,22 +175,27 @@ Napi::Value AudioPlayer::Load(const Napi::CallbackInfo& info) {
         return env.Null();
     }
 
-    const std::string path = info[0].As<Napi::String>().Utf8Value();
-
     Cleanup();
 
+    const std::string utf8Path = info[0].As<Napi::String>().Utf8Value();
     ma_result result;
-    ma_device_config deviceConfig;
+#ifdef _WIN32
+    std::u16string path16 = info[0].As<Napi::String>().Utf16Value();
+    std::wstring path(path16.begin(), path16.end());
 
-    result = ma_decoder_init_file(path.c_str(), nullptr, &decoder);
+    result = ma_decoder_init_file_w(path.c_str(), nullptr, &decoder);
+#else
+    result = ma_decoder_init_file(utf8Path.c_str(), nullptr, &decoder);
+#endif
     if (result != MA_SUCCESS) {
-        printf("Could not load file: %s\n", path.c_str());
-        Napi::Error::New(env, "Invalid File Path!")
-        .ThrowAsJavaScriptException();
+        std::string message = "Invalid file path: \"" + utf8Path + "\"";
+
+        Napi::Error::New(env, message).ThrowAsJavaScriptException();
         return env.Null();
     }
     decoderInitialized = true;
 
+    ma_device_config deviceConfig;
     deviceConfig = ma_device_config_init(ma_device_type_playback);
     deviceConfig.playback.format = decoder.outputFormat;
     deviceConfig.playback.channels = decoder.outputChannels;
