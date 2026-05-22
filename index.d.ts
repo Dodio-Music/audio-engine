@@ -15,20 +15,12 @@ export interface AudioPlayerState {
 
 export class AudioPlayer {
     constructor();
-    initDevice({bufferCapacityMs, drainLowWaterMs, startThresholdMs}?: {
-        bufferCapacityMs: number,
-        drainLowWaterMs: number,
-        startThresholdMs: number
-    }): boolean;
-    play(): void;
-    stop(): void;
-    write(buffer: Buffer): number;
+    load(filePath: string): void;
+    pause(): void;
+    resume(): void;
+    togglePlayPause(): boolean;
     getState(): AudioPlayerState;
     pause(): void;
-    flush(): void;
-    endOfStream(): void;
-    setDrainCallback(callback: () => void): void;
-    setEndedCallback(callback: () => void): void;
     setVolume(volume: number): void;
 }
 
