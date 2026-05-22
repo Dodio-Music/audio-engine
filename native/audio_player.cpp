@@ -19,6 +19,7 @@ private:
     Napi::Value TogglePlayPause(const Napi::CallbackInfo& info);
     Napi::Value Seek(const Napi::CallbackInfo& info);
     Napi::Value SetVolume(const Napi::CallbackInfo& info);
+    Napi::Value GetState(const Napi::CallbackInfo& info);
 
     void Cleanup();
 
@@ -35,6 +36,9 @@ private:
 
     std::atomic<bool> seekRequested = false;
     std::atomic<ma_uint64> seekTargetFrame = 0;
+
+    std::atomic<ma_uint64> songFramesPlayed = 0;
+    std::atomic<bool> ended = false;
 };
 
 Napi::FunctionReference AudioPlayer::constructor;
@@ -61,7 +65,8 @@ Napi::Object AudioPlayer::Init(Napi::Env env, Napi::Object exports) {
             InstanceMethod("resume", &AudioPlayer::Resume),
             InstanceMethod("togglePlayPause", &AudioPlayer::TogglePlayPause),
             InstanceMethod("seek", &AudioPlayer::Seek),
-            InstanceMethod("setVolume", &AudioPlayer::SetVolume)
+            InstanceMethod("setVolume", &AudioPlayer::SetVolume),
+            InstanceMethod("getState", &AudioPlayer::GetState)
         }
     );
 
@@ -104,6 +109,18 @@ void AudioPlayer::DataCallback(ma_device* pDevice, void* pOutput, const void* pI
         &framesRead
     );
 
+    player->songFramesPlayed.fetch_add(framesRead, std::memory_order_relaxed);
+
+    if (framesRead < frameCount) {
+        player->ended.store(true, std::memory_order_relaxed);
+
+        // fill remaining space with silence
+        const ma_uint32 channels = pDevice->playback.channels;
+        const ma_format format = pDevice->playback.format;
+        const size_t bytesPerFrame = ma_get_bytes_per_frame(format, channels);
+        std::memset(static_cast<char*>(pOutput) + framesRead * bytesPerFrame,0,(frameCount - framesRead) * bytesPerFrame);
+    }
+
     (void)pInput;
 }
 
@@ -113,6 +130,8 @@ Napi::Value AudioPlayer::Seek(const Napi::CallbackInfo &info) {
     const auto frame = static_cast<ma_uint64>(seconds * decoder.outputSampleRate);
 
     seekTargetFrame.store(frame, std::memory_order_relaxed);
+    songFramesPlayed.store(frame, std::memory_order_relaxed);
+    ended.store(false, std::memory_order_relaxed);
     seekRequested.store(true, std::memory_order_relaxed);
 
     return env.Undefined();
@@ -254,6 +273,25 @@ Napi::Value AudioPlayer::Load(const Napi::CallbackInfo& info) {
     }
 
     playing = true;
+    songFramesPlayed.store(0, std::memory_order_relaxed);
+    ended.store(false, std::memory_order_relaxed);
 
     return env.Undefined();
+}
+
+Napi::Value AudioPlayer::GetState(const Napi::CallbackInfo& info) {
+    const auto env = info.Env();
+    const ma_uint64 frames = songFramesPlayed.load(std::memory_order_relaxed);
+
+    double seconds = 0.0;
+    if (decoderInitialized && decoder.outputSampleRate > 0) {
+        seconds = static_cast<double>(frames) / static_cast<double>(decoder.outputSampleRate);
+    }
+
+    Napi::Object state = Napi::Object::New(env);
+    state.Set("songFramesPlayed", Napi::Number::New(env, static_cast<double>(frames)));
+    state.Set("songSecondsPlayed", Napi::Number::New(env, seconds));
+    state.Set("ended", Napi::Boolean::New(env, ended.load(std::memory_order_relaxed)));
+
+    return state;
 }

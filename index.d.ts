@@ -1,16 +1,7 @@
-import { Buffer } from "node:buffer";
-
 export interface AudioPlayerState {
-    sampleRate: number;
-    channels: number;
-    bufferedFrames: number;
-    bufferCapacityFrames: number;
-    underrunCount: number;
-    eos: boolean;
-    transportState: "stopped" | "buffering" | "playing" | "paused";
-    volume: boolean;
     songFramesPlayed: number;
-    songFramesWritten: number;
+    songSecondsPlayed: number;
+    ended: boolean;
 }
 
 export class AudioPlayer {
