@@ -2,6 +2,7 @@ export interface AudioPlayerState {
     songFramesPlayed: number;
     songSecondsPlayed: number;
     ended: boolean;
+    playing: boolean;
 }
 
 export class AudioPlayer {
@@ -12,6 +13,7 @@ export class AudioPlayer {
     togglePlayPause(): boolean;
     seek(timeSeconds: number): void;
     setVolume(volume: number): void;
+    onEnded(cb: () => void): void;
 
     getState(): AudioPlayerState;
 }

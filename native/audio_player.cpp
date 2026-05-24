@@ -20,6 +20,7 @@ private:
     Napi::Value Seek(const Napi::CallbackInfo& info);
     Napi::Value SetVolume(const Napi::CallbackInfo& info);
     Napi::Value GetState(const Napi::CallbackInfo& info);
+    Napi::Value OnEnded(const Napi::CallbackInfo& info);
 
     void Cleanup();
 
@@ -31,7 +32,7 @@ private:
     ma_device device{};
     bool deviceInitialized = false;
 
-    bool playing = false;
+    std::atomic<bool> playing = false;
     float volume = 1.0f;
 
     std::atomic<bool> seekRequested = false;
@@ -40,7 +41,8 @@ private:
     std::atomic<ma_uint64> songFramesPlayed = 0;
     std::atomic<bool> ended = false;
 
-
+    Napi::ThreadSafeFunction endedCallback;
+    std::atomic<bool> endedCallbackSet = false;
 };
 
 Napi::FunctionReference AudioPlayer::constructor;
@@ -68,7 +70,8 @@ Napi::Object AudioPlayer::Init(Napi::Env env, Napi::Object exports) {
             InstanceMethod("togglePlayPause", &AudioPlayer::TogglePlayPause),
             InstanceMethod("seek", &AudioPlayer::Seek),
             InstanceMethod("setVolume", &AudioPlayer::SetVolume),
-            InstanceMethod("getState", &AudioPlayer::GetState)
+            InstanceMethod("getState", &AudioPlayer::GetState),
+            InstanceMethod("onEnded", &AudioPlayer::OnEnded),
         }
     );
 
@@ -123,7 +126,17 @@ void AudioPlayer::DataCallback(ma_device* pDevice, void* pOutput, const void* pI
     player->songFramesPlayed.fetch_add(framesRead, std::memory_order_relaxed);
 
     if (result != MA_SUCCESS || framesRead < frameCount) {
-        player->ended.store(true, std::memory_order_relaxed);
+        // make sure ended is actually false to avoid double call
+        if (!player->ended.exchange(true, std::memory_order_acq_rel) && player->endedCallbackSet.load(std::memory_order_acquire)) {
+            player->playing.store(false, std::memory_order_release);
+
+            player->ended.store(true, std::memory_order_relaxed);
+            if (player->endedCallbackSet.load(std::memory_order_acquire)) {
+                player->endedCallback.NonBlockingCall([](Napi::Env env, Napi::Function jsCallback) {
+                    jsCallback.Call({});
+                });
+            }
+        }
     }
 }
 
@@ -178,7 +191,7 @@ Napi::Value AudioPlayer::Pause(const Napi::CallbackInfo& info) {
     const Napi::Env env = info.Env();
     if (deviceInitialized) {
         ma_device_stop(&device);
-        playing = false;
+        playing.store(false, std::memory_order_release);
     }
 
     return env.Undefined();
@@ -187,6 +200,14 @@ Napi::Value AudioPlayer::Pause(const Napi::CallbackInfo& info) {
 Napi::Value AudioPlayer::Resume(const Napi::CallbackInfo& info) {
     const Napi::Env env = info.Env();
     if (deviceInitialized) {
+        // case: song has finished playing, user wants to replay
+        if (ended.load(std::memory_order_acquire)) {
+            seekTargetFrame.store(0, std::memory_order_relaxed);
+            songFramesPlayed.store(0, std::memory_order_relaxed);
+            ended.store(false, std::memory_order_release);
+            seekRequested.store(true, std::memory_order_release);
+        }
+
         ma_result result = ma_device_start(&device);
         if (result != MA_SUCCESS) {
             Napi::Error::New(env, "Failed to resume playback!")
@@ -194,7 +215,7 @@ Napi::Value AudioPlayer::Resume(const Napi::CallbackInfo& info) {
             return env.Null();
         }
 
-        playing = true;
+        playing.store(true, std::memory_order_release);
     }
 
     return env.Undefined();
@@ -208,7 +229,7 @@ Napi::Value AudioPlayer::TogglePlayPause(const Napi::CallbackInfo &info) {
         Resume(info);
     }
 
-    return Napi::Boolean::New(env, playing);
+    return Napi::Boolean::New(env, playing.load(std::memory_order_acquire));
 }
 
 Napi::Value AudioPlayer::Load(const Napi::CallbackInfo& info) {
@@ -295,6 +316,27 @@ Napi::Value AudioPlayer::GetState(const Napi::CallbackInfo& info) {
     state.Set("songFramesPlayed", Napi::Number::New(env, static_cast<double>(frames)));
     state.Set("songSecondsPlayed", Napi::Number::New(env, seconds));
     state.Set("ended", Napi::Boolean::New(env, ended.load(std::memory_order_relaxed)));
+    state.Set("playing", Napi::Boolean::New(env,playing.load(std::memory_order_acquire)));
 
     return state;
+}
+
+Napi::Value AudioPlayer::OnEnded(const Napi::CallbackInfo &info) {
+    auto env = info.Env();
+
+    if (info.Length() < 1 || !info[0].IsFunction()) {
+        Napi::TypeError::New(env, "Expected callback function.").ThrowAsJavaScriptException();
+        return env.Null();
+    }
+
+    if (endedCallbackSet.load(std::memory_order_relaxed)) {
+        endedCallback.Release();
+        endedCallbackSet.store(false, std::memory_order_relaxed);
+    }
+
+    endedCallback = Napi::ThreadSafeFunction::New(env, info[0].As<Napi::Function>(),
+        "AudioPlayerEndedCallback", 0, 1);
+
+    endedCallbackSet.store(true, std::memory_order_relaxed);
+    return env.Undefined();
 }
