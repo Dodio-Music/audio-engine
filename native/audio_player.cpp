@@ -39,6 +39,8 @@ private:
 
     std::atomic<ma_uint64> songFramesPlayed = 0;
     std::atomic<bool> ended = false;
+
+
 };
 
 Napi::FunctionReference AudioPlayer::constructor;
@@ -84,25 +86,34 @@ Napi::Object InitAll(Napi::Env env, Napi::Object exports) {
 NODE_API_MODULE(dodio_audio, InitAll)
 
 void AudioPlayer::DataCallback(ma_device* pDevice, void* pOutput, const void* pInput, ma_uint32 frameCount) {
+    (void)pInput;
+
     auto* player = static_cast<AudioPlayer*>(pDevice->pUserData);
 
+    // if decoder isn't initialized, don't process buffer
     if (player == nullptr || !player->decoderInitialized) {
-        memset(pOutput, 0, frameCount * ma_get_bytes_per_frame(
-            pDevice->playback.format,
-            pDevice->playback.channels
-        ));
         return;
     }
 
     if (player->seekRequested.exchange(false, std::memory_order_acquire)) {
-        ma_decoder_seek_to_pcm_frame(
-            &player->decoder,
-            player->seekTargetFrame.load(std::memory_order_relaxed)
-        );
+        const ma_uint64 targetFrame = player->seekTargetFrame.load(std::memory_order_relaxed);
+
+        if (ma_decoder_seek_to_pcm_frame(&player->decoder, targetFrame) == MA_SUCCESS) {
+            player->songFramesPlayed.store(targetFrame, std::memory_order_relaxed);
+            player->ended.store(false, std::memory_order_relaxed);
+        } else {
+            player->ended.store(true, std::memory_order_relaxed);
+            return;
+        }
+    }
+
+    // if song has ended, don't process buffer
+    if (player->ended.load(std::memory_order_relaxed)) {
+        return;
     }
 
     ma_uint64 framesRead = 0;
-    ma_decoder_read_pcm_frames(
+    const ma_result result = ma_decoder_read_pcm_frames(
         &player->decoder,
         pOutput,
         frameCount,
@@ -111,17 +122,9 @@ void AudioPlayer::DataCallback(ma_device* pDevice, void* pOutput, const void* pI
 
     player->songFramesPlayed.fetch_add(framesRead, std::memory_order_relaxed);
 
-    if (framesRead < frameCount) {
+    if (result != MA_SUCCESS || framesRead < frameCount) {
         player->ended.store(true, std::memory_order_relaxed);
-
-        // fill remaining space with silence
-        const ma_uint32 channels = pDevice->playback.channels;
-        const ma_format format = pDevice->playback.format;
-        const size_t bytesPerFrame = ma_get_bytes_per_frame(format, channels);
-        std::memset(static_cast<char*>(pOutput) + framesRead * bytesPerFrame,0,(frameCount - framesRead) * bytesPerFrame);
     }
-
-    (void)pInput;
 }
 
 Napi::Value AudioPlayer::Seek(const Napi::CallbackInfo &info) {
