@@ -8,6 +8,7 @@ export interface AudioPlayerState {
 export class AudioPlayer {
     constructor();
     load(filePath: string): void;
+    prepareNext(filePath: string): void;
     pause(): void;
     resume(): void;
     togglePlayPause(): boolean;

@@ -21,8 +21,9 @@ private:
     Napi::Value SetVolume(const Napi::CallbackInfo& info);
     Napi::Value GetState(const Napi::CallbackInfo& info);
     Napi::Value OnEnded(const Napi::CallbackInfo& info);
+    Napi::Value PrepareNext(const Napi::CallbackInfo& info);
 
-    void Cleanup();
+    void Cleanup(Napi::Env env);
 
     static void DataCallback(ma_device* pDevice, void* pOutput, const void* pInput, ma_uint32 frameCount);
 
@@ -31,16 +32,16 @@ private:
 
     ma_device device{};
     bool deviceInitialized = false;
+    float volume = 1.0f;
 
     std::atomic<bool> playing = false;
-    float volume = 1.0f;
 
     std::atomic<bool> seekRequested = false;
     std::atomic<ma_uint64> seekTargetFrame = 0;
 
     std::atomic<ma_uint64> songFramesPlayed = 0;
-    std::atomic<bool> ended = false;
 
+    std::atomic<bool> ended = false;
     Napi::ThreadSafeFunction endedCallback;
     std::atomic<bool> endedCallbackSet = false;
 };
@@ -72,6 +73,7 @@ Napi::Object AudioPlayer::Init(Napi::Env env, Napi::Object exports) {
             InstanceMethod("setVolume", &AudioPlayer::SetVolume),
             InstanceMethod("getState", &AudioPlayer::GetState),
             InstanceMethod("onEnded", &AudioPlayer::OnEnded),
+            InstanceMethod("prepareNext", &AudioPlayer::PrepareNext)
         }
     );
 
@@ -87,6 +89,20 @@ Napi::Object InitAll(Napi::Env env, Napi::Object exports) {
 }
 
 NODE_API_MODULE(dodio_audio, InitAll)
+
+static void DebugLog(const Napi::Env env, const std::string& message) {
+    const Napi::Object global = env.Global();
+    const Napi::Value consoleValue = global.Get("console");
+
+    if (!consoleValue.IsObject()) return;
+
+    const auto console = consoleValue.As<Napi::Object>();
+    const Napi::Value debugValue = console.Get("debug");
+
+    if (!debugValue.IsFunction()) return;
+
+    debugValue.As<Napi::Function>().Call(console, { Napi::String::New(env, message) });
+}
 
 void AudioPlayer::DataCallback(ma_device* pDevice, void* pOutput, const void* pInput, ma_uint32 frameCount) {
     (void)pInput;
@@ -142,9 +158,16 @@ void AudioPlayer::DataCallback(ma_device* pDevice, void* pOutput, const void* pI
 
 Napi::Value AudioPlayer::Seek(const Napi::CallbackInfo &info) {
     const auto env = info.Env();
-    const double seconds = info[0].As<Napi::Number>().DoubleValue();
-    const auto frame = static_cast<ma_uint64>(seconds * decoder.outputSampleRate);
+    double seconds = info[0].As<Napi::Number>().DoubleValue();
+    if (seconds < 0) seconds = 0;
 
+    if (!decoderInitialized) {
+        Napi::Error::New(env, "Seek failed! Decoder is not initialized.")
+                .ThrowAsJavaScriptException();
+        return env.Null();
+    }
+
+    const auto frame = static_cast<ma_uint64>(seconds * decoder.outputSampleRate);
     seekTargetFrame.store(frame, std::memory_order_relaxed);
     songFramesPlayed.store(frame, std::memory_order_relaxed);
     ended.store(false, std::memory_order_relaxed);
@@ -172,10 +195,11 @@ Napi::Value AudioPlayer::SetVolume(const Napi::CallbackInfo& info) {
     return env.Undefined();
 }
 
-void AudioPlayer::Cleanup() {
+void AudioPlayer::Cleanup(const Napi::Env env) {
     if (deviceInitialized) {
         ma_device_stop(&device);
         ma_device_uninit(&device);
+        DebugLog(env, "Uninitialized playback device.");
         deviceInitialized = false;
     }
 
@@ -240,7 +264,7 @@ Napi::Value AudioPlayer::Load(const Napi::CallbackInfo& info) {
         return env.Null();
     }
 
-    Cleanup();
+    Cleanup(env);
 
     const std::string utf8Path = info[0].As<Napi::String>().Utf8Value();
     ma_result result;
@@ -278,12 +302,17 @@ Napi::Value AudioPlayer::Load(const Napi::CallbackInfo& info) {
         return env.Null();
     }
     deviceInitialized = true;
+    DebugLog(env,
+        std::string("Playback device initialized [format=") + ma_get_format_name(decoder.outputFormat)
+        + ", channels=" + std::to_string(decoder.outputChannels) + ", sampleRate="
+        + std::to_string(decoder.outputSampleRate) + "]");
 
     ma_device_set_master_volume(&device, volume);
 
     result = ma_device_start(&device);
     if (result != MA_SUCCESS) {
         ma_device_uninit(&device);
+        DebugLog(env, "Uninitialized playback device.");
         deviceInitialized = false;
 
         ma_decoder_uninit(&decoder);
@@ -301,6 +330,12 @@ Napi::Value AudioPlayer::Load(const Napi::CallbackInfo& info) {
     ended.store(false, std::memory_order_relaxed);
 
     return env.Undefined();
+}
+
+Napi::Value AudioPlayer::PrepareNext(const Napi::CallbackInfo &info) {
+    const Napi::Env env = info.Env();
+
+    return env.Null();
 }
 
 Napi::Value AudioPlayer::GetState(const Napi::CallbackInfo& info) {
