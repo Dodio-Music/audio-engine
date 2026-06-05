@@ -15,6 +15,7 @@ export class AudioPlayer {
     seek(timeSeconds: number): void;
     setVolume(volume: number): void;
     onEnded(cb: () => void): void;
+    onAdvanced(cb: (trackIndex: number) => void): void;
 
     getState(): AudioPlayerState;
 }
