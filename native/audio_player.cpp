@@ -23,6 +23,7 @@ private:
     Napi::Value OnEnded(const Napi::CallbackInfo& info);
     Napi::Value PrepareNext(const Napi::CallbackInfo& info);
 
+    void InitDevice(Napi::Env env);
     void Cleanup(Napi::Env env);
 
     static void DataCallback(ma_device* pDevice, void* pOutput, const void* pInput, ma_uint32 frameCount);
@@ -32,6 +33,10 @@ private:
 
     ma_device device{};
     bool deviceInitialized = false;
+    ma_format deviceFormat = ma_format_unknown;
+    ma_uint32 deviceChannels = 0;
+    ma_uint32 deviceSampleRate = 0;
+
     float volume = 1.0f;
 
     std::atomic<bool> playing = false;
@@ -208,7 +213,7 @@ void AudioPlayer::Cleanup(const Napi::Env env) {
         decoderInitialized = false;
     }
 
-    playing = false;
+    playing.store(false, std::memory_order_release);
 }
 
 Napi::Value AudioPlayer::Pause(const Napi::CallbackInfo& info) {
@@ -247,7 +252,7 @@ Napi::Value AudioPlayer::Resume(const Napi::CallbackInfo& info) {
 
 Napi::Value AudioPlayer::TogglePlayPause(const Napi::CallbackInfo &info) {
     const Napi::Env env = info.Env();
-    if (playing) {
+    if (playing.load(std::memory_order_relaxed)) {
         Pause(info);
     } else {
         Resume(info);
@@ -258,78 +263,107 @@ Napi::Value AudioPlayer::TogglePlayPause(const Napi::CallbackInfo &info) {
 
 Napi::Value AudioPlayer::Load(const Napi::CallbackInfo& info) {
     const Napi::Env env = info.Env();
+
     if (info.Length() < 1 || !info[0].IsString()) {
         Napi::TypeError::New(env, "Expected a path (string).")
         .ThrowAsJavaScriptException();
         return env.Null();
     }
-
-    Cleanup(env);
-
     const std::string utf8Path = info[0].As<Napi::String>().Utf8Value();
+
+    InitDevice(env);
+    if (!deviceInitialized) {
+        return env.Null();
+    }
+
+    ma_device_stop(&device);
+
+    if (decoderInitialized) {
+        ma_decoder_uninit(&decoder);
+        decoderInitialized = false;
+    }
+
+    const ma_decoder_config decoderConfig = ma_decoder_config_init(deviceFormat, deviceChannels, deviceSampleRate);
+
     ma_result result;
 #ifdef _WIN32
     std::u16string path16 = info[0].As<Napi::String>().Utf16Value();
     std::wstring path(path16.begin(), path16.end());
 
-    result = ma_decoder_init_file_w(path.c_str(), nullptr, &decoder);
+    result = ma_decoder_init_file_w(path.c_str(), &decoderConfig, &decoder);
 #else
-    result = ma_decoder_init_file(utf8Path.c_str(), nullptr, &decoder);
+    result = ma_decoder_init_file(utf8Path.c_str(), &decoderConfig, &decoder);
 #endif
     if (result != MA_SUCCESS) {
         std::string message = "Invalid file path: \"" + utf8Path + "\"";
-
         Napi::Error::New(env, message).ThrowAsJavaScriptException();
         return env.Null();
     }
+
     decoderInitialized = true;
-
-    ma_device_config deviceConfig;
-    deviceConfig = ma_device_config_init(ma_device_type_playback);
-    deviceConfig.playback.format = decoder.outputFormat;
-    deviceConfig.playback.channels = decoder.outputChannels;
-    deviceConfig.sampleRate = decoder.outputSampleRate;
-    deviceConfig.dataCallback = DataCallback;
-    deviceConfig.pUserData = this;
-
-    result = ma_device_init(nullptr, &deviceConfig, &device);
-    if (result != MA_SUCCESS) {
-        ma_decoder_uninit(&decoder);
-        decoderInitialized = false;
-
-        Napi::Error::New(env, "Failed to open playback device!")
-        .ThrowAsJavaScriptException();
-        return env.Null();
-    }
-    deviceInitialized = true;
-    DebugLog(env,
-        std::string("Playback device initialized [format=") + ma_get_format_name(decoder.outputFormat)
-        + ", channels=" + std::to_string(decoder.outputChannels) + ", sampleRate="
-        + std::to_string(decoder.outputSampleRate) + "]");
-
-    ma_device_set_master_volume(&device, volume);
+    playing.store(true, std::memory_order_release);
+    songFramesPlayed.store(0, std::memory_order_relaxed);
+    ended.store(false, std::memory_order_relaxed);
+    seekRequested.store(false, std::memory_order_relaxed);
 
     result = ma_device_start(&device);
     if (result != MA_SUCCESS) {
-        ma_device_uninit(&device);
-        DebugLog(env, "Uninitialized playback device.");
-        deviceInitialized = false;
-
         ma_decoder_uninit(&decoder);
         decoderInitialized = false;
-
-        playing = false;
+        playing.store(false, std::memory_order_release);
 
         Napi::Error::New(env, "Failed to start playback device!")
         .ThrowAsJavaScriptException();
         return env.Null();
     }
 
-    playing = true;
-    songFramesPlayed.store(0, std::memory_order_relaxed);
-    ended.store(false, std::memory_order_relaxed);
+    DebugLog(
+        env,
+        std::string("Decoder initialized to device format [format=")
+        + ma_get_format_name(decoder.outputFormat)
+        + ", channels=" + std::to_string(decoder.outputChannels)
+        + ", sampleRate=" + std::to_string(decoder.outputSampleRate)
+        + "]"
+    );
 
     return env.Undefined();
+}
+
+void AudioPlayer::InitDevice(const Napi::Env env) {
+    if (deviceInitialized) {
+        return;
+    }
+    ma_device_config deviceConfig = ma_device_config_init(ma_device_type_playback);
+
+    // device defaults
+    deviceConfig.playback.format = ma_format_unknown;
+    deviceConfig.playback.channels = 0;
+    deviceConfig.sampleRate = 0;
+    deviceConfig.dataCallback = DataCallback;
+    deviceConfig.pUserData = this;
+
+    if (ma_device_init(nullptr, &deviceConfig, &device) != MA_SUCCESS) {
+        Napi::Error::New(env, "Failed to open playback device!")
+            .ThrowAsJavaScriptException();
+        return;
+    }
+
+    deviceInitialized = true;
+
+    deviceFormat = device.playback.format;
+    deviceChannels = device.playback.channels;
+    deviceSampleRate = device.sampleRate;
+
+    ma_device_set_master_volume(&device, volume);
+
+    DebugLog(
+        env,
+        std::string("Playback device initialized [format=")
+        + ma_get_format_name(device.playback.format)
+        + ", channels=" + std::to_string(device.playback.channels)
+        + ", sampleRate=" + std::to_string( device.sampleRate)
+        + "]"
+    );
 }
 
 Napi::Value AudioPlayer::PrepareNext(const Napi::CallbackInfo &info) {
