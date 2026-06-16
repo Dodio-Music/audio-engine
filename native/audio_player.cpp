@@ -588,7 +588,7 @@ Napi::Value AudioPlayer::GetState(const Napi::CallbackInfo& info) {
     }
 
     double seconds = 0.0;
-    if (decoder && decoder.get()->outputSampleRate > 0) {
+    if (sampleRate > 0) {
         seconds = static_cast<double>(frames) / static_cast<double>(sampleRate);
     }
 
